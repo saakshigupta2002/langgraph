@@ -5,6 +5,7 @@ import sys
 from functools import partial
 from typing import (
     Annotated,
+    Any,
     Literal,
     TypeVar,
 )
@@ -38,6 +39,7 @@ from pydantic.v1 import BaseModel as BaseModelV1
 from typing_extensions import TypedDict
 
 from langgraph.prebuilt import (
+    MalformedFunctionCallError,
     ToolNode,
     create_react_agent,
     tools_condition,
@@ -2154,3 +2156,119 @@ def test_create_react_agent_inject_vars_with_post_model_hook(
         AIMessage("hi-hi-6", id="1"),
     ]
     assert result["foo"] == 2
+
+
+# Tests for on_malformed_tool_call parameter (Issue #6574)
+
+
+class FakeModelWithMalformedFunctionCall(BaseChatModel):
+    """A fake model that returns MALFORMED_FUNCTION_CALL finish_reason."""
+
+    def _generate(
+        self,
+        messages: list[AnyMessage],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        from langchain_core.outputs import ChatGeneration, ChatResult
+
+        message = AIMessage(
+            content="",
+            id="0",
+            tool_calls=[],  # Empty tool_calls simulates the issue
+            response_metadata={"finish_reason": "MALFORMED_FUNCTION_CALL"},
+        )
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+    @property
+    def _llm_type(self) -> str:
+        return "fake-malformed-model"
+
+    def bind_tools(
+        self,
+        tools: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Bind tools to the model (no-op for this fake model)."""
+        return self
+
+
+def test_malformed_function_call_ignore_default() -> None:
+    """Test that on_malformed_tool_call='ignore' (default) silently terminates."""
+    model = FakeModelWithMalformedFunctionCall()
+
+    def dummy_tool(x: str) -> str:
+        """A dummy tool."""
+        return x
+
+    agent = create_react_agent(
+        model,
+        [dummy_tool],
+        # Default is "ignore"
+    )
+    result = agent.invoke({"messages": [HumanMessage("hi")]})
+    # Should terminate without error
+    assert len(result["messages"]) == 2
+    assert result["messages"][-1].response_metadata["finish_reason"] == "MALFORMED_FUNCTION_CALL"
+
+
+def test_malformed_function_call_raise() -> None:
+    """Test that on_malformed_tool_call='raise' raises MalformedFunctionCallError."""
+    model = FakeModelWithMalformedFunctionCall()
+
+    def dummy_tool(x: str) -> str:
+        """A dummy tool."""
+        return x
+
+    agent = create_react_agent(
+        model,
+        [dummy_tool],
+        on_malformed_tool_call="raise",
+    )
+    with pytest.raises(MalformedFunctionCallError) as exc_info:
+        agent.invoke({"messages": [HumanMessage("hi")]})
+
+    assert exc_info.value.finish_reason == "MALFORMED_FUNCTION_CALL"
+    assert "malformed function call" in str(exc_info.value).lower()
+
+
+def test_malformed_function_call_warn() -> None:
+    """Test that on_malformed_tool_call='warn' emits warning and terminates."""
+    model = FakeModelWithMalformedFunctionCall()
+
+    def dummy_tool(x: str) -> str:
+        """A dummy tool."""
+        return x
+
+    agent = create_react_agent(
+        model,
+        [dummy_tool],
+        on_malformed_tool_call="warn",
+    )
+    with pytest.warns(UserWarning, match="malformed function call"):
+        result = agent.invoke({"messages": [HumanMessage("hi")]})
+
+    # Should terminate after warning
+    assert len(result["messages"]) == 2
+    assert result["messages"][-1].response_metadata["finish_reason"] == "MALFORMED_FUNCTION_CALL"
+
+
+def test_normal_operation_not_affected_by_malformed_param() -> None:
+    """Test that normal operation is not affected when no malformed response."""
+    model = FakeToolCallingModel()
+
+    def dummy_tool(x: str) -> str:
+        """A dummy tool."""
+        return x
+
+    # Test with raise - should not raise for normal responses
+    agent = create_react_agent(
+        model,
+        [dummy_tool],
+        on_malformed_tool_call="raise",
+    )
+    result = agent.invoke({"messages": [HumanMessage("hi")]})
+    # Should complete normally
+    assert len(result["messages"]) == 2
+    assert result["messages"][-1].content == "hi"

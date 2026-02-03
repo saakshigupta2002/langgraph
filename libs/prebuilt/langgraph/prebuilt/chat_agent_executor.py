@@ -50,6 +50,24 @@ StructuredResponse = dict | BaseModel
 StructuredResponseSchema = dict | type[BaseModel]
 
 
+class MalformedFunctionCallError(Exception):
+    """Raised when the LLM returns a malformed function call.
+
+    This typically occurs with certain LLM providers (e.g., Google Gemini) when
+    the model attempts to generate a tool call but produces invalid JSON or
+    malformed arguments. The error includes the `finish_reason` from the model's
+    response metadata.
+
+    Attributes:
+        finish_reason: The finish_reason value from the model's response_metadata
+            (e.g., "MALFORMED_FUNCTION_CALL" for Gemini).
+    """
+
+    def __init__(self, message: str, finish_reason: str):
+        super().__init__(message)
+        self.finish_reason = finish_reason
+
+
 @deprecated(
     "AgentState has been moved to `langchain.agents`. Please update your import to `from langchain.agents import AgentState`.",
     category=LangGraphDeprecatedSinceV10,
@@ -304,6 +322,7 @@ def create_react_agent(
     debug: bool = False,
     version: Literal["v1", "v2"] = "v2",
     name: str | None = None,
+    on_malformed_tool_call: Literal["ignore", "raise", "warn"] = "ignore",
     **deprecated_kwargs: Any,
 ) -> CompiledStateGraph:
     """Creates an agent graph that calls tools in a loop until a stopping condition is met.
@@ -460,6 +479,16 @@ def create_react_agent(
         name: An optional name for the `CompiledStateGraph`.
             This name will be automatically used when adding ReAct agent graph to another graph as a subgraph node -
             particularly useful for building multi-agent systems.
+        on_malformed_tool_call: Behavior when the LLM returns a malformed function call
+            (e.g., Gemini's `MALFORMED_FUNCTION_CALL` finish_reason). Options:
+
+            - `"ignore"` (default): Silently terminate the agent loop (backwards-compatible behavior)
+            - `"raise"`: Raise a `MalformedFunctionCallError` exception
+            - `"warn"`: Log a warning and terminate the agent loop
+
+            This is particularly useful when using Google Gemini models, which may
+            return `finish_reason="MALFORMED_FUNCTION_CALL"` when the model attempts
+            to call a tool but generates invalid JSON.
 
     !!! warning "`config_schema` Deprecated"
         The `config_schema` parameter is deprecated in v0.6.0 and support will be removed in v2.0.0.
@@ -825,6 +854,30 @@ def create_react_agent(
     def should_continue(state: StateSchema) -> str | list[Send]:
         messages = _get_state_value(state, "messages")
         last_message = messages[-1]
+
+        # Check for malformed function call finish_reason (e.g., Gemini)
+        if isinstance(last_message, AIMessage) and on_malformed_tool_call != "ignore":
+            finish_reason = getattr(last_message, "response_metadata", {}).get(
+                "finish_reason"
+            )
+            if finish_reason == "MALFORMED_FUNCTION_CALL":
+                if on_malformed_tool_call == "raise":
+                    raise MalformedFunctionCallError(
+                        f"LLM returned malformed function call "
+                        f"(finish_reason={finish_reason}). "
+                        "The model attempted to call a tool but generated invalid JSON. "
+                        "Consider retrying or using a different model.",
+                        finish_reason=finish_reason,
+                    )
+                elif on_malformed_tool_call == "warn":
+                    warnings.warn(
+                        f"LLM returned malformed function call "
+                        f"(finish_reason={finish_reason}). Terminating agent loop.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    # Fall through to normal END logic
+
         # If there is no function call, then we finish
         if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
             if post_model_hook is not None:
